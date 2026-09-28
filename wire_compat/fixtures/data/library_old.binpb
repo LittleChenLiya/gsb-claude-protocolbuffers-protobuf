@@ -1,0 +1,29 @@
+
+Ï
+library_old.protowirecompat.demo.v1"¡
+Book
+
+id (
+
+title_text (	
+isbn (	
+legacy_price (
+old_tags (	4
+labels (2$.wirecompat.demo.v1.Book.LabelsEntry-
+LabelsEntry
+key (	
+value (:8"C
+Library
+name (	*
+book_ref (2.wirecompat.demo.v1.Book".
+Slots
+
+seat_count (
+	room_code (	"Å
+Reservation
+confirmation (	
+obsolete_note (	
+internal_handle (	,
+Review
+review_text (	
+stars (bproto3
