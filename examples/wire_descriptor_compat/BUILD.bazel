@@ -1,0 +1,19 @@
+load("@rules_python//python:py_binary.bzl", "py_binary")
+
+py_binary(
+    name = "create_wire_compat_fixtures",
+    srcs = ["create_wire_compat_fixtures.py"],
+    python_version = "PY3",
+    deps = ["@com_google_protobuf//python:protobuf_python"],
+)
+
+py_binary(
+    name = "demo",
+    srcs = ["demo.py"],
+    data = [
+        "new_fds.binpb",
+        "old_fds.binpb",
+    ],
+    python_version = "PY3",
+    deps = ["@com_google_protobuf//python:protobuf_python"],
+)

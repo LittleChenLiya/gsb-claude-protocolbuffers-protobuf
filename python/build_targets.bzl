@@ -392,6 +392,11 @@ def build_targets(name):
     )
 
     internal_py_test(
+        name = "descriptor_compat_test",
+        srcs = ["google/protobuf/internal/descriptor_compat_test.py"],
+    )
+
+    internal_py_test(
         name = "field_mask_test",
         srcs = ["google/protobuf/internal/field_mask_test.py"],
     )

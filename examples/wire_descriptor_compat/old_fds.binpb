@@ -1,0 +1,22 @@
+
+Ë
+wirecompat/fixture/old.protowirecompat.fixture"¢
+Root
+old_name (
+number_as_int (
+choice_field (
+removed_reserved (	
+removed_unreserved (	
+tags (	
+Nested
+value ("o
+Labels6
+labels (2&.wirecompat.fixture.Labels.LabelsEntry-
+LabelsEntry
+key (	
+value (:8"y
+Payloads<
+payloads (2*.wirecompat.fixture.Payloads.PayloadsEntry/
+PayloadsEntry
+key (	
+value (	:8bproto3
