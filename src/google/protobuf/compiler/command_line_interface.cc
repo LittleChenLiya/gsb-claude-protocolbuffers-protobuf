@@ -71,6 +71,7 @@
 #include "absl/types/optional.h"
 #include "absl/types/span.h"
 #include "google/protobuf/compiler/code_generator.h"
+#include "google/protobuf/compiler/import_diagnostic.h"
 #include "google/protobuf/compiler/importer.h"
 #include "google/protobuf/compiler/plugin.pb.h"
 #include "google/protobuf/compiler/retention.h"
@@ -1593,6 +1594,16 @@ int CommandLineInterface::Run(int argc, const char* const argv[]) {
           }
         }
         break;
+      case PRINT_IMPORT_DIAGNOSTIC:
+        // Read-only import diagnostics: analyze how every type, extension,
+        // service method and custom option reference is made visible by the
+        // import graph, and report which imports are unused.  This never
+        // modifies the parsed files or writes any output artifacts.
+        for (size_t i = 0; i < parsed_files.size(); ++i) {
+          std::cout << FormatImportDiagnosticReport(
+              AnalyzeImportVisibility(*parsed_files[i]));
+        }
+        break;
       case PRINT_NONE:
         ABSL_LOG(ERROR)
             << "If the code reaches here, it usually means a bug of "
@@ -2197,6 +2208,7 @@ bool CommandLineInterface::ParseArgument(const char* arg, std::string* name,
       *name == "--notices" ||
       *name == "--experimental_editions" ||
       *name == "--print_free_field_numbers" ||
+      *name == "--print_import_diagnostic" ||
       *name == "--experimental_allow_proto3_optional" ||
       *name == "--deterministic_output" ||
       *name == "--unsafe_allow_out_dir_escape" || *name == "--fatal_warnings") {
@@ -2529,6 +2541,21 @@ CommandLineInterface::InterpretArgument(const std::string& name,
     }
     mode_ = MODE_PRINT;
     print_mode_ = PRINT_FREE_FIELDS;
+  } else if (name == "--print_import_diagnostic") {
+    if (mode_ != MODE_COMPILE) {
+      std::cerr << "Cannot use " << name
+                << " and use --encode, --decode or print "
+                << "other info at the same time." << std::endl;
+      return PARSE_ARGUMENT_FAIL;
+    }
+    if (!output_directives_.empty() || !descriptor_set_out_name_.empty()) {
+      std::cerr << "Cannot use " << name
+                << " and generate code or descriptors at the same time."
+                << std::endl;
+      return PARSE_ARGUMENT_FAIL;
+    }
+    mode_ = MODE_PRINT;
+    print_mode_ = PRINT_IMPORT_DIAGNOSTIC;
   } else if (name == "--enable_codegen_trace") {
     // We use environment variables here so that subprocesses see this setting
     // when we spawn them.
@@ -2746,6 +2773,14 @@ Parse PROTO_FILES and generate output based on the options given:
   --print_free_field_numbers  Print the free field numbers of the messages
                               defined in the given proto files. Extension ranges
                               are counted as occupied fields numbers.
+  --print_import_diagnostic   Print a read-only diagnostic of the imports of the
+                              given proto files: for every type, extension,
+                              service method and custom option reference, show
+                              the import chain that makes it visible (direct
+                              or through public imports), and report imports
+                              that are unused and may be removed. Weak imports
+                              are never reported as unused. No output files
+                              are generated.
   --enable_codegen_trace      Enables tracing which parts of protoc are
                               responsible for what codegen output. Not supported
                               by all backends or on all platforms.

@@ -180,11 +180,13 @@ cc_library(
     name = "command_line_interface",
     srcs = [
         "command_line_interface.cc",
+        "import_diagnostic.cc",
         "subprocess.cc",
         "zip_writer.cc",
     ],
     hdrs = [
         "command_line_interface.h",
+        "import_diagnostic.h",
         "notices.h",
         "subprocess.h",
         "zip_writer.h",

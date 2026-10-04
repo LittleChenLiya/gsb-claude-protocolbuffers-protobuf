@@ -397,6 +397,7 @@ set(libprotoc_srcs
   ${protobuf_SOURCE_DIR}/src/google/protobuf/compiler/code_generator.cc
   ${protobuf_SOURCE_DIR}/src/google/protobuf/compiler/code_generator_lite.cc
   ${protobuf_SOURCE_DIR}/src/google/protobuf/compiler/command_line_interface.cc
+  ${protobuf_SOURCE_DIR}/src/google/protobuf/compiler/import_diagnostic.cc
   ${protobuf_SOURCE_DIR}/src/google/protobuf/compiler/cpp/enum.cc
   ${protobuf_SOURCE_DIR}/src/google/protobuf/compiler/cpp/extension.cc
   ${protobuf_SOURCE_DIR}/src/google/protobuf/compiler/cpp/field.cc
@@ -544,6 +545,7 @@ set(libprotoc_hdrs
   ${protobuf_SOURCE_DIR}/src/google/protobuf/compiler/code_generator.h
   ${protobuf_SOURCE_DIR}/src/google/protobuf/compiler/code_generator_lite.h
   ${protobuf_SOURCE_DIR}/src/google/protobuf/compiler/command_line_interface.h
+  ${protobuf_SOURCE_DIR}/src/google/protobuf/compiler/import_diagnostic.h
   ${protobuf_SOURCE_DIR}/src/google/protobuf/compiler/cpp/enum.h
   ${protobuf_SOURCE_DIR}/src/google/protobuf/compiler/cpp/extension.h
   ${protobuf_SOURCE_DIR}/src/google/protobuf/compiler/cpp/field.h

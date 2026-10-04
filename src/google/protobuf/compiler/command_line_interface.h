@@ -425,8 +425,9 @@ class PROTOC_EXPORT CommandLineInterface {
   Mode mode_ = MODE_COMPILE;
 
   enum PrintMode {
-    PRINT_NONE,         // Not in MODE_PRINT
-    PRINT_FREE_FIELDS,  // --print_free_fields
+    PRINT_NONE,          // Not in MODE_PRINT
+    PRINT_FREE_FIELDS,   // --print_free_fields
+    PRINT_IMPORT_DIAGNOSTIC,  // --print_import_diagnostic
   };
 
   PrintMode print_mode_ = PRINT_NONE;
