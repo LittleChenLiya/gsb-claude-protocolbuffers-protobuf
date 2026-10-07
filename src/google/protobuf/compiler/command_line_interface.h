@@ -322,6 +322,15 @@ class PROTOC_EXPORT CommandLineInterface {
   // Implements the --edition_defaults_out option.
   bool WriteEditionDefaults(const DescriptorPool& pool);
 
+  // Implements the --import_diagnostic_out option.  This is a read-only
+  // analysis: it inspects the already-built descriptors and reports, for
+  // every input file, how each referenced symbol is made visible by the
+  // file's imports (direct, public-transitive, weak or option imports) and
+  // which imports could be removed.
+  bool WriteImportDiagnostic(
+      const std::vector<const FileDescriptor*>& parsed_files,
+      const DescriptorPool& pool);
+
   // Implements the --dependency_out option
   bool GenerateDependencyManifestFile(
       const std::vector<const FileDescriptor*>& parsed_files,
@@ -493,6 +502,10 @@ class PROTOC_EXPORT CommandLineInterface {
   // If --dependency_out was given, this is the path to the file where the
   // dependency file will be written. Otherwise, empty.
   std::string dependency_out_name_;
+
+  // If --import_diagnostic_out was given, this is the path to the file where
+  // the read-only import diagnostic report will be written. Otherwise, empty.
+  std::string import_diagnostic_out_name_;
 
   bool experimental_editions_ = false;
 

@@ -1163,6 +1163,435 @@ bool ValidateOptionImports(const FileDescriptor& file,
   return true;
 }
 
+// -------------------------------------------------------------------
+// Support for --import_diagnostic_out: a read-only analysis of how the
+// imports of each input file provide visibility to the symbols it
+// references.
+
+// A single symbol reference made by a file.
+struct ImportDiagnosticSymbolRef {
+  std::string name;             // Fully-qualified symbol name.
+  std::string kind;             // "message", "enum", "custom-option", ...
+  const FileDescriptor* file;   // File defining the referenced symbol.
+};
+
+// Collects every symbol referenced by a file: field/extended types, service
+// method input/output types and custom options (file-level, message-level,
+// field-level, enum-level, service/method-level, oneof and extension-range
+// options).  The analysis is purely descriptor based, so it does not depend
+// on SourceCodeInfo being present.
+struct ImportDiagnosticSymbolCollector {
+  const DescriptorPool& pool;
+  const FileDescriptor* file;  // The file being analyzed.
+  std::vector<ImportDiagnosticSymbolRef>* refs;
+  absl::flat_hash_set<std::string>* seen;  // Dedupe key: kind + '\n' + name.
+
+  void AddRef(absl::string_view name, absl::string_view kind,
+              const FileDescriptor* defined_in) {
+    if (defined_in == nullptr || defined_in == file) return;
+    if (!seen->insert(absl::StrCat(kind, "\n", name)).second) return;
+    refs->push_back(
+        ImportDiagnosticSymbolRef{std::string(name), std::string(kind),
+                                  defined_in});
+  }
+
+  // Records every custom option (option extension) set in `options`,
+  // recursing into message-valued options to catch extensions nested inside
+  // aggregate option values.  Standard (non-extension) option fields are
+  // ignored: they are defined in descriptor.proto, which does not need to be
+  // imported to use them.
+  void CollectOptionRefs(const Message& options) {
+    const Descriptor* options_type =
+        pool.FindMessageTypeByName(options.GetTypeName());
+    if (options_type == nullptr) {
+      // descriptor.proto is not in the pool, which means no custom options
+      // can exist for this element.
+      return;
+    }
+    DynamicMessageFactory factory;
+    std::unique_ptr<Message> dynamic_options(
+        factory.GetPrototype(options_type)->New());
+    std::string serialized;
+    if (!options.SerializeToString(&serialized) ||
+        !dynamic_options->ParseFromString(serialized)) {
+      return;
+    }
+    CollectOptionExtensions(*dynamic_options);
+  }
+
+  void CollectOptionExtensions(const Message& options) {
+    const Reflection* reflection = options.GetReflection();
+    std::vector<const FieldDescriptor*> fields;
+    reflection->ListFields(options, &fields);
+    for (const FieldDescriptor* field : fields) {
+      if (field->is_extension()) {
+        AddRef(field->full_name(), "custom-option", field->file());
+      }
+      if (field->cpp_type() == FieldDescriptor::CPPTYPE_MESSAGE) {
+        if (field->is_repeated()) {
+          int count = reflection->FieldSize(options, field);
+          for (int i = 0; i < count; ++i) {
+            CollectOptionExtensions(
+                reflection->GetRepeatedMessage(options, field, i));
+          }
+        } else {
+          CollectOptionExtensions(reflection->GetMessage(options, field));
+        }
+      }
+    }
+  }
+
+  void operator()(const FileDescriptor& desc) {
+    CollectOptionRefs(desc.options());
+  }
+  void operator()(const Descriptor& desc) {
+    CollectOptionRefs(desc.options());
+  }
+  void operator()(const Descriptor::ExtensionRange& desc) {
+    CollectOptionRefs(desc.options());
+  }
+  void operator()(const OneofDescriptor& desc) {
+    CollectOptionRefs(desc.options());
+  }
+  void operator()(const EnumDescriptor& desc) {
+    CollectOptionRefs(desc.options());
+  }
+  void operator()(const EnumValueDescriptor& desc) {
+    CollectOptionRefs(desc.options());
+  }
+  void operator()(const ServiceDescriptor& desc) {
+    CollectOptionRefs(desc.options());
+  }
+  void operator()(const MethodDescriptor& desc) {
+    AddRef(desc.input_type()->full_name(), "message",
+           desc.input_type()->file());
+    AddRef(desc.output_type()->full_name(), "message",
+           desc.output_type()->file());
+    CollectOptionRefs(desc.options());
+  }
+  void operator()(const FieldDescriptor& desc) {
+    if (desc.message_type() != nullptr) {
+      AddRef(desc.message_type()->full_name(), "message",
+             desc.message_type()->file());
+    }
+    if (desc.enum_type() != nullptr) {
+      AddRef(desc.enum_type()->full_name(), "enum", desc.enum_type()->file());
+    }
+    if (desc.is_extension()) {
+      // The extended message must be visible to this file.
+      AddRef(desc.containing_type()->full_name(), "extendee",
+             desc.containing_type()->file());
+    }
+    CollectOptionRefs(desc.options());
+  }
+};
+
+// A chain of imports through which a symbol is visible, e.g.
+// a.proto -[import]-> b.proto -[public]-> c.proto.
+struct ImportVisibilityChain {
+  // files[0] is the importing file.  edge_kinds[i] describes the edge from
+  // files[i] to files[i+1]: "import", "public", "weak" or "option".
+  std::vector<const FileDescriptor*> files;
+  std::vector<std::string> edge_kinds;
+};
+
+std::string RenderImportChain(const ImportVisibilityChain& chain) {
+  std::string out(chain.files[0]->name());
+  for (size_t i = 1; i < chain.files.size(); ++i) {
+    absl::StrAppend(&out, " -[", chain.edge_kinds[i - 1], "]-> ",
+                    chain.files[i]->name());
+  }
+  return out;
+}
+
+// Compares two chains by their sequence of file names.
+bool ImportChainLess(const ImportVisibilityChain& a,
+                     const ImportVisibilityChain& b) {
+  for (size_t i = 0; i < a.files.size() && i < b.files.size(); ++i) {
+    int cmp = a.files[i]->name().compare(b.files[i]->name());
+    if (cmp != 0) return cmp < 0;
+  }
+  return a.files.size() < b.files.size();
+}
+
+// The kind of edge from `file` to its dependency at index `index`.
+std::string ImportEdgeKind(const FileDescriptor& file, int index) {
+  const FileDescriptor* dep = file.dependency(index);
+  for (int i = 0; i < file.weak_dependency_count(); ++i) {
+    if (file.weak_dependency(i) == dep) return "weak";
+  }
+  for (int i = 0; i < file.public_dependency_count(); ++i) {
+    if (file.public_dependency(i) == dep) return "public";
+  }
+  return "import";
+}
+
+// Returns every import edge of `file`: regular dependencies (plain, public
+// or weak) followed by option dependencies ("import option"), which are
+// stored separately from the regular dependencies.
+std::vector<std::pair<const FileDescriptor*, std::string>> ImportEdgesOf(
+    const FileDescriptor& file, const DescriptorPool& pool) {
+  std::vector<std::pair<const FileDescriptor*, std::string>> edges;
+  for (int i = 0; i < file.dependency_count(); ++i) {
+    edges.push_back({file.dependency(i), ImportEdgeKind(file, i)});
+  }
+  for (int i = 0; i < file.option_dependency_count(); ++i) {
+    const FileDescriptor* dep =
+        pool.FindFileByName(file.option_dependency_name(i));
+    if (dep != nullptr) {
+      edges.push_back({dep, "option"});
+    }
+  }
+  return edges;
+}
+
+// Result of a shortest-chain search: the lexicographically smallest (by file
+// name) shortest chain, plus the number of equally short chains so that
+// ambiguity can be reported.
+struct ImportChainSearchResult {
+  ImportVisibilityChain best;
+  int chain_count = 0;  // Capped at kMaxCountedChains.
+};
+
+constexpr int kMaxCountedChains = 1000;
+
+// Computes the shortest visibility chains from `from` to each file in
+// `targets`.  The first hop may use any dependency edge of `from` (plain,
+// public, weak or option import); every subsequent hop must be a public
+// import, which mirrors the visibility rules enforced by the descriptor
+// pool.  For each target the lexicographically smallest chain (by file
+// name) is chosen as the stable witness and the number of equivalent
+// shortest chains is recorded.
+absl::flat_hash_map<const FileDescriptor*, ImportChainSearchResult>
+ComputeImportChains(const FileDescriptor* from,
+                    const absl::flat_hash_set<const FileDescriptor*>& targets,
+                    const DescriptorPool& pool,
+                    const FileDescriptor* only_first_hop = nullptr) {
+  // Breadth-first search recording, for each reached file, its distance and
+  // the predecessor edges that achieve it.
+  absl::flat_hash_map<const FileDescriptor*, int> distance;
+  absl::flat_hash_map<const FileDescriptor*,
+                      std::vector<std::pair<const FileDescriptor*, std::string>>>
+      predecessors;
+  std::vector<const FileDescriptor*> bfs_order;
+  distance[from] = 0;
+  bfs_order.push_back(from);
+  for (size_t front = 0; front < bfs_order.size(); ++front) {
+    const FileDescriptor* node = bfs_order[front];
+    int node_distance = distance[node];
+    auto relax = [&](const FileDescriptor* next, const std::string& kind) {
+      auto it = distance.find(next);
+      if (it == distance.end()) {
+        distance[next] = node_distance + 1;
+        predecessors[next].push_back({node, kind});
+        bfs_order.push_back(next);
+      } else if (it->second == node_distance + 1) {
+        predecessors[next].push_back({node, kind});
+      }
+    };
+    if (node == from) {
+      for (const auto& edge : ImportEdgesOf(*node, pool)) {
+        if (only_first_hop != nullptr && edge.first != only_first_hop) {
+          continue;
+        }
+        relax(edge.first, edge.second);
+      }
+    } else {
+      for (int i = 0; i < node->public_dependency_count(); ++i) {
+        relax(node->public_dependency(i), "public");
+      }
+    }
+  }
+
+  absl::flat_hash_map<const FileDescriptor*, ImportChainSearchResult> results;
+  for (const FileDescriptor* target : targets) {
+    if (target == from || !distance.contains(target)) continue;
+    // Enumerate the shortest chains backwards over the predecessor DAG with
+    // an explicit indexed DFS (distances strictly decrease, so it
+    // terminates), keeping the lexicographically smallest chain and counting
+    // the rest (with a cap).
+    ImportChainSearchResult result;
+    // `path` holds the current partial chain from `target` back towards
+    // `from`: path[i] is the file at distance-i-from-target and
+    // next_index[i] is the next predecessor of path[i] to explore.
+    std::vector<const FileDescriptor*> path{target};
+    std::vector<std::string> path_kinds;
+    std::vector<size_t> next_index{0};
+    while (!path.empty() && result.chain_count < kMaxCountedChains) {
+      const FileDescriptor* node = path.back();
+      if (node == from) {
+        // Materialize the chain from `from` to `target`.
+        ImportVisibilityChain chain;
+        chain.files.push_back(from);
+        for (size_t i = path.size(); i-- > 1;) {
+          chain.files.push_back(path[i - 1]);
+          chain.edge_kinds.push_back(path_kinds[i - 1]);
+        }
+        if (result.chain_count == 0 || ImportChainLess(chain, result.best)) {
+          result.best = std::move(chain);
+        }
+        if (result.chain_count < kMaxCountedChains) {
+          ++result.chain_count;
+        }
+        if (path.size() > 1) path_kinds.pop_back();
+        path.pop_back();
+        next_index.pop_back();
+        continue;
+      }
+      const auto& preds = predecessors[node];
+      if (next_index.back() < preds.size()) {
+        const auto& pred = preds[next_index.back()++];
+        path.push_back(pred.first);
+        path_kinds.push_back(pred.second);
+        next_index.push_back(0);
+      } else {
+        if (path.size() > 1) path_kinds.pop_back();
+        path.pop_back();
+        next_index.pop_back();
+      }
+    }
+    results[target] = std::move(result);
+  }
+  return results;
+}
+
+// Builds the text report for --import_diagnostic_out.  The report is
+// deterministic: imports are listed in declaration order and symbols are
+// sorted by name.
+std::string BuildImportDiagnosticReport(
+    const std::vector<const FileDescriptor*>& parsed_files,
+    const DescriptorPool& pool) {
+  std::string out;
+  absl::StrAppend(
+      &out,
+      "# Import diagnostic report (read-only analysis).\n"
+      "# For each input file, shows through which import chain every\n"
+      "# referenced symbol is visible, and which imports can be removed.\n");
+
+  for (const FileDescriptor* file : parsed_files) {
+    std::vector<ImportDiagnosticSymbolRef> refs;
+    absl::flat_hash_set<std::string> seen;
+    ImportDiagnosticSymbolCollector collector{pool, file, &refs, &seen};
+    google::protobuf::internal::VisitDescriptors(*file, collector);
+    std::sort(refs.begin(), refs.end(),
+              [](const ImportDiagnosticSymbolRef& a,
+                 const ImportDiagnosticSymbolRef& b) {
+                if (a.name != b.name) return a.name < b.name;
+                return a.kind < b.kind;
+              });
+
+    absl::flat_hash_set<const FileDescriptor*> used_files;
+    for (const ImportDiagnosticSymbolRef& ref : refs) {
+      used_files.insert(ref.file);
+    }
+
+    // Best visibility chain to every file that defines a referenced symbol.
+    absl::flat_hash_map<const FileDescriptor*, ImportChainSearchResult>
+        chains = ComputeImportChains(file, used_files, pool);
+
+    // Every import edge of the file, in declaration order (regular imports
+    // first, then option imports).
+    std::vector<std::pair<const FileDescriptor*, std::string>> edges =
+        ImportEdgesOf(*file, pool);
+
+    absl::StrAppend(&out, "\nfile: \"", file->name(), "\"\n");
+    if (edges.empty()) {
+      absl::StrAppend(&out, "  (no imports)\n");
+    }
+
+    for (const auto& edge : edges) {
+      const FileDescriptor* dep = edge.first;
+      const std::string& edge_kind = edge.second;
+      absl::StrAppend(&out, "  import \"", dep->name(), "\"");
+      if (edge_kind != "import") {
+        absl::StrAppend(&out, " [", edge_kind, "]");
+      }
+      if (edge_kind == "weak") {
+        absl::StrAppend(
+            &out,
+            ": used-weak\n"
+            "    reason: weak import; weak imports are always retained and "
+            "are never reported as unused\n");
+        continue;
+      }
+      if (used_files.contains(dep)) {
+        int count = 0;
+        for (const ImportDiagnosticSymbolRef& ref : refs) {
+          if (ref.file == dep) ++count;
+        }
+        absl::StrAppend(&out, ": used-direct\n    reason: ", count,
+                        " referenced symbol(s) are defined in this file\n");
+        continue;
+      }
+      // The import is not used directly; check whether it re-exports a used
+      // symbol through a public import chain.
+      absl::flat_hash_map<const FileDescriptor*, ImportChainSearchResult>
+          via = ComputeImportChains(file, used_files, pool, dep);
+      if (!via.empty()) {
+        // Pick a stable witness: shortest chain, then lexicographically
+        // smallest by file name, then smallest symbol name.
+        const ImportDiagnosticSymbolRef* witness = nullptr;
+        const ImportChainSearchResult* witness_chain = nullptr;
+        for (const ImportDiagnosticSymbolRef& ref : refs) {
+          auto it = via.find(ref.file);
+          if (it == via.end()) continue;
+          if (witness_chain == nullptr ||
+              it->second.best.files.size() < witness_chain->best.files.size() ||
+              (it->second.best.files.size() ==
+                   witness_chain->best.files.size() &&
+               (ImportChainLess(it->second.best, witness_chain->best) ||
+                (!ImportChainLess(witness_chain->best, it->second.best) &&
+                 ref.name < witness->name)))) {
+            witness = &ref;
+            witness_chain = &it->second;
+          }
+        }
+        absl::StrAppend(
+            &out,
+            ": used-public\n"
+            "    reason: re-exports referenced symbol(s) through public "
+            "import chain(s)\n"
+            "    witness: ",
+            witness->name, " (", witness->kind, ") visible via ",
+            RenderImportChain(witness_chain->best), "\n");
+        continue;
+      }
+      absl::StrAppend(&out, ": unused\n    reason: no symbol referenced by ",
+                      file->name(), " is defined in \"", dep->name(),
+                      "\" or re-exported through its public imports; this "
+                      "import can be removed\n");
+    }
+
+    for (const ImportDiagnosticSymbolRef& ref : refs) {
+      absl::StrAppend(&out, "  symbol \"", ref.name, "\" (", ref.kind,
+                      ") defined in \"", ref.file->name(), "\"\n");
+      auto it = chains.find(ref.file);
+      if (it == chains.end()) {
+        // Cannot happen for a successfully built file: every referenced
+        // symbol must be visible through some import chain.
+        absl::StrAppend(&out, "    chain: <not visible through any import "
+                              "chain>\n");
+        continue;
+      }
+      absl::StrAppend(&out, "    chain: ", RenderImportChain(it->second.best),
+                      "\n");
+      if (it->second.chain_count > 1) {
+        absl::StrAppend(&out, "    ambiguity: ");
+        if (it->second.chain_count >= kMaxCountedChains) {
+          absl::StrAppend(&out, "at least ", kMaxCountedChains);
+        } else {
+          absl::StrAppend(&out, it->second.chain_count);
+        }
+        absl::StrAppend(
+            &out,
+            " equivalent shortest chains exist; the lexicographically "
+            "smallest (by file name) is shown as the witness\n");
+      }
+    }
+  }
+  return out;
+}
+
 }  // namespace
 
 namespace {
@@ -1490,6 +1919,14 @@ int CommandLineInterface::Run(int argc, const char* const argv[]) {
 
   if (!EnforceProtocEditionsSupport(parsed_files)) {
     return 1;
+  }
+
+  // Read-only import diagnostic: analyze the successfully built descriptors
+  // and report how each import provides visibility to referenced symbols.
+  if (!import_diagnostic_out_name_.empty()) {
+    if (!WriteImportDiagnostic(parsed_files, *descriptor_pool)) {
+      return 1;
+    }
   }
 
   // We construct a separate GeneratorContext for each output location.  Note
@@ -1847,6 +2284,7 @@ void CommandLineInterface::Clear() {
   descriptor_set_in_names_.clear();
   descriptor_set_out_name_.clear();
   dependency_out_name_.clear();
+  import_diagnostic_out_name_.clear();
 
   experimental_editions_ = false;
   edition_defaults_out_name_.clear();
@@ -2107,12 +2545,18 @@ CommandLineInterface::ParseArgumentStatus CommandLineInterface::ParseArguments(
     return PARSE_ARGUMENT_FAIL;
   }
   if (mode_ == MODE_COMPILE && output_directives_.empty() &&
-      descriptor_set_out_name_.empty() && edition_defaults_out_name_.empty()) {
+      descriptor_set_out_name_.empty() && edition_defaults_out_name_.empty() &&
+      import_diagnostic_out_name_.empty()) {
     std::cerr << "Missing output directives." << std::endl;
     return PARSE_ARGUMENT_FAIL;
   }
   if (mode_ != MODE_COMPILE && !dependency_out_name_.empty()) {
     std::cerr << "Can only use --dependency_out=FILE when generating code."
+              << std::endl;
+    return PARSE_ARGUMENT_FAIL;
+  }
+  if (mode_ != MODE_COMPILE && !import_diagnostic_out_name_.empty()) {
+    std::cerr << "Can only use --import_diagnostic_out=FILE when compiling."
               << std::endl;
     return PARSE_ARGUMENT_FAIL;
   }
@@ -2397,6 +2841,17 @@ CommandLineInterface::InterpretArgument(const std::string& name,
       return PARSE_ARGUMENT_FAIL;
     }
     dependency_out_name_ = value;
+
+  } else if (name == "--import_diagnostic_out") {
+    if (!import_diagnostic_out_name_.empty()) {
+      std::cerr << name << " may only be passed once." << std::endl;
+      return PARSE_ARGUMENT_FAIL;
+    }
+    if (value.empty()) {
+      std::cerr << name << " requires a non-empty value." << std::endl;
+      return PARSE_ARGUMENT_FAIL;
+    }
+    import_diagnostic_out_name_ = value;
 
   } else if (name == "--include_imports") {
     if (imports_in_descriptor_set_) {
@@ -2736,6 +3191,23 @@ Parse PROTO_FILES and generate output based on the options given:
   --dependency_out=FILE       Write a dependency output file in the format
                               expected by make. This writes the transitive
                               set of input file paths to FILE
+  --import_diagnostic_out=FILE
+                              Perform a read-only import analysis after the
+                              descriptors have been built and write the
+                              report to FILE. For every input file the
+                              report shows, for each referenced type,
+                              extension (including custom options) and
+                              service method input/output type, the import
+                              chain through which it is visible (direct,
+                              public transitive, weak or option import),
+                              and flags imports that can be removed because
+                              nothing they provide (directly or through
+                              public re-exports) is ever referenced. Weak
+                              imports are never reported as unused. When
+                              several equivalent public chains exist, the
+                              lexicographically smallest one (by file name)
+                              is reported as the witness and the ambiguity
+                              is noted.
   --error_format=FORMAT       Set the format in which to print errors.
                               FORMAT may be 'gcc' (the default) or 'msvs'
                               (Microsoft Visual Studio format).
@@ -3013,6 +3485,34 @@ bool CommandLineInterface::GenerateDependencyManifestFile(
         return false;
       }
     }
+  }
+
+  return true;
+}
+
+bool CommandLineInterface::WriteImportDiagnostic(
+    const std::vector<const FileDescriptor*>& parsed_files,
+    const DescriptorPool& pool) {
+  std::string report = BuildImportDiagnosticReport(parsed_files, pool);
+
+  int fd;
+  do {
+    fd = open(import_diagnostic_out_name_.c_str(),
+              O_WRONLY | O_CREAT | O_TRUNC | O_BINARY, 0666);
+  } while (fd < 0 && errno == EINTR);
+
+  if (fd < 0) {
+    perror(import_diagnostic_out_name_.c_str());
+    return false;
+  }
+
+  io::FileOutputStream out(fd);
+  out.SetCloseOnDelete(true);
+  io::Printer printer(&out, '$');
+  printer.PrintRaw(report);
+  if (printer.failed()) {
+    perror(import_diagnostic_out_name_.c_str());
+    return false;
   }
 
   return true;

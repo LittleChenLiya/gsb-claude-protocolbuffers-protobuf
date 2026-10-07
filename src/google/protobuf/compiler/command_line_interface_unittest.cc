@@ -4182,6 +4182,320 @@ TEST_F(CommandLineInterfaceTest,
 }
 #endif  // !_WIN32
 
+TEST_F(CommandLineInterfaceTest, ImportDiagnosticPublicChain) {
+  // a imports b, b publicly imports c, and a references a type from c:
+  // the report must show the full visibility chain.
+  CreateTempFile("c.proto",
+                 "syntax = \"proto3\";\n"
+                 "package pkg.c;\n"
+                 "message Msg {}\n");
+  CreateTempFile("b.proto",
+                 "syntax = \"proto3\";\n"
+                 "package pkg.b;\n"
+                 "import public \"c.proto\";\n"
+                 "message B { pkg.c.Msg f = 1; }\n");
+  CreateTempFile("unused.proto",
+                 "syntax = \"proto3\";\n"
+                 "package pkg.unused;\n"
+                 "message Never {}\n");
+  CreateTempFile("a.proto",
+                 "syntax = \"proto3\";\n"
+                 "package pkg.a;\n"
+                 "import \"b.proto\";\n"
+                 "import \"unused.proto\";\n"
+                 "message A {\n"
+                 "  pkg.c.Msg f = 1;\n"
+                 "  pkg.b.B g = 2;\n"
+                 "}\n");
+
+  Run("protocol_compiler --import_diagnostic_out=$tmpdir/report "
+      "--proto_path=$tmpdir a.proto");
+
+  ExpectNoErrors();
+  ExpectFileContentContainsSubstring(
+      "report", "import \"b.proto\": used-direct\n");
+  ExpectFileContentContainsSubstring(
+      "report", "import \"unused.proto\": unused\n");
+  ExpectFileContentContainsSubstring("report", "this import can be removed\n");
+  ExpectFileContentContainsSubstring(
+      "report",
+      "symbol \"pkg.c.Msg\" (message) defined in \"c.proto\"\n"
+      "    chain: a.proto -[import]-> b.proto -[public]-> c.proto\n");
+}
+
+TEST_F(CommandLineInterfaceTest, ImportDiagnosticUsedPublicImport) {
+  // A file that only uses symbols re-exported through a public import must
+  // see that import classified as used-public, not unused.
+  CreateTempFile("c.proto",
+                 "syntax = \"proto3\";\n"
+                 "package pkg.c;\n"
+                 "message Msg {}\n");
+  CreateTempFile("b.proto",
+                 "syntax = \"proto3\";\n"
+                 "package pkg.b;\n"
+                 "import public \"c.proto\";\n");
+  CreateTempFile("a.proto",
+                 "syntax = \"proto3\";\n"
+                 "package pkg.a;\n"
+                 "import \"b.proto\";\n"
+                 "message A { pkg.c.Msg f = 1; }\n");
+
+  Run("protocol_compiler --import_diagnostic_out=$tmpdir/report "
+      "--proto_path=$tmpdir a.proto");
+
+  ExpectNoErrors();
+  ExpectFileContentContainsSubstring(
+      "report", "import \"b.proto\": used-public\n");
+  ExpectFileContentContainsSubstring(
+      "report",
+      "witness: pkg.c.Msg (message) visible via "
+      "a.proto -[import]-> b.proto -[public]-> c.proto\n");
+}
+
+TEST_F(CommandLineInterfaceTest, ImportDiagnosticCustomOptionDependency) {
+  // A dependency that is only used through custom options (field-level and
+  // file-level) must not be reported as unused.
+  CreateTempFile("google/protobuf/descriptor.proto",
+                 google::protobuf::FileOptions::descriptor()->file()->DebugString());
+  CreateTempFile("opt.proto",
+                 "syntax = \"proto2\";\n"
+                 "package my.opt;\n"
+                 "import \"google/protobuf/descriptor.proto\";\n"
+                 "extend google.protobuf.FieldOptions {\n"
+                 "  optional string my_opt = 50001;\n"
+                 "}\n"
+                 "extend google.protobuf.FileOptions {\n"
+                 "  optional string file_opt = 50002;\n"
+                 "}\n");
+  CreateTempFile("main.proto",
+                 "syntax = \"proto2\";\n"
+                 "package pkg.main;\n"
+                 "import \"opt.proto\";\n"
+                 "option (my.opt.file_opt) = \"file-level\";\n"
+                 "message M {\n"
+                 "  optional string f = 1 [(my.opt.my_opt) = \"x\"];\n"
+                 "}\n");
+
+  Run("protocol_compiler --import_diagnostic_out=$tmpdir/report "
+      "--proto_path=$tmpdir main.proto");
+
+  ExpectNoErrors();
+  ExpectFileContentContainsSubstring(
+      "report", "import \"opt.proto\": used-direct\n");
+  ExpectFileContentContainsSubstring(
+      "report",
+      "symbol \"my.opt.my_opt\" (custom-option) defined in \"opt.proto\"\n");
+  ExpectFileContentContainsSubstring(
+      "report",
+      "symbol \"my.opt.file_opt\" (custom-option) defined in \"opt.proto\"\n");
+}
+
+TEST_F(CommandLineInterfaceTest, ImportDiagnosticServiceMethodTypes) {
+  // Types that are only referenced as service method input/output must keep
+  // their defining import alive.
+  CreateTempFile("dep.proto",
+                 "syntax = \"proto3\";\n"
+                 "package pkg.dep;\n"
+                 "message Req {}\n"
+                 "message Resp {}\n");
+  CreateTempFile("svc.proto",
+                 "syntax = \"proto3\";\n"
+                 "package pkg.svc;\n"
+                 "import \"dep.proto\";\n"
+                 "service S { rpc Call(pkg.dep.Req) returns (pkg.dep.Resp); }\n");
+
+  Run("protocol_compiler --import_diagnostic_out=$tmpdir/report "
+      "--proto_path=$tmpdir svc.proto");
+
+  ExpectNoErrors();
+  ExpectFileContentContainsSubstring(
+      "report", "import \"dep.proto\": used-direct\n");
+  ExpectFileContentContainsSubstring(
+      "report", "symbol \"pkg.dep.Req\" (message) defined in \"dep.proto\"\n");
+  ExpectFileContentContainsSubstring(
+      "report",
+      "symbol \"pkg.dep.Resp\" (message) defined in \"dep.proto\"\n");
+}
+
+TEST_F(CommandLineInterfaceTest, ImportDiagnosticWeakImportNeverUnused) {
+  // Weak imports are never reported as removable.
+  CreateTempFile("weakdep.proto",
+                 "syntax = \"proto2\";\n"
+                 "package pkg.weakdep;\n"
+                 "message W {}\n");
+  CreateTempFile("user.proto",
+                 "syntax = \"proto2\";\n"
+                 "package pkg.user;\n"
+                 "import weak \"weakdep.proto\";\n"
+                 "message Holder {}\n");
+
+  Run("protocol_compiler --import_diagnostic_out=$tmpdir/report "
+      "--proto_path=$tmpdir user.proto");
+
+  ExpectNoErrors();
+  ExpectFileContentContainsSubstring(
+      "report", "import \"weakdep.proto\" [weak]: used-weak\n");
+  ExpectFileContentNotContainsSubstring("report",
+                                        "this import can be removed");
+}
+
+TEST_F(CommandLineInterfaceTest, ImportDiagnosticAmbiguousPublicChains) {
+  // Two equivalent public chains: the lexicographically smallest one (by
+  // file name) is the witness and the ambiguity is reported.
+  CreateTempFile("amb_c.proto",
+                 "syntax = \"proto3\";\n"
+                 "package pkg.ambc;\n"
+                 "message Shared {}\n");
+  CreateTempFile("amb_b1.proto",
+                 "syntax = \"proto3\";\n"
+                 "package pkg.ambb1;\n"
+                 "import public \"amb_c.proto\";\n");
+  CreateTempFile("amb_b2.proto",
+                 "syntax = \"proto3\";\n"
+                 "package pkg.ambb2;\n"
+                 "import public \"amb_c.proto\";\n");
+  CreateTempFile("amb_a.proto",
+                 "syntax = \"proto3\";\n"
+                 "package pkg.amba;\n"
+                 "import \"amb_b2.proto\";\n"
+                 "import \"amb_b1.proto\";\n"
+                 "message Use { pkg.ambc.Shared s = 1; }\n");
+
+  Run("protocol_compiler --import_diagnostic_out=$tmpdir/report "
+      "--proto_path=$tmpdir amb_a.proto");
+
+  ExpectNoErrors();
+  ExpectFileContentContainsSubstring(
+      "report",
+      "chain: amb_a.proto -[import]-> amb_b1.proto -[public]-> amb_c.proto\n");
+  ExpectFileContentContainsSubstring("report",
+                                     "ambiguity: 2 equivalent shortest "
+                                     "chains exist");
+}
+
+TEST_F(CommandLineInterfaceTest, ImportDiagnosticSameNameDifferentPackages) {
+  // Same message name in two different packages: usage must be attributed
+  // to the right file.
+  CreateTempFile("px/foo.proto",
+                 "syntax = \"proto3\";\n"
+                 "package p1;\n"
+                 "message Thing {}\n");
+  CreateTempFile("py/foo.proto",
+                 "syntax = \"proto3\";\n"
+                 "package p2;\n"
+                 "message Thing {}\n");
+  CreateTempFile("user.proto",
+                 "syntax = \"proto3\";\n"
+                 "package pkg.same;\n"
+                 "import \"px/foo.proto\";\n"
+                 "import \"py/foo.proto\";\n"
+                 "message Uses { p1.Thing t = 1; }\n");
+
+  Run("protocol_compiler --import_diagnostic_out=$tmpdir/report "
+      "--proto_path=$tmpdir user.proto");
+
+  ExpectNoErrors();
+  ExpectFileContentContainsSubstring(
+      "report", "import \"px/foo.proto\": used-direct\n");
+  ExpectFileContentContainsSubstring(
+      "report", "import \"py/foo.proto\": unused\n");
+  ExpectFileContentContainsSubstring(
+      "report", "symbol \"p1.Thing\" (message) defined in \"px/foo.proto\"\n");
+}
+
+TEST_F(CommandLineInterfaceTest, ImportDiagnosticCyclicImportFails) {
+  // Cyclic imports keep failing through the regular compiler path; no
+  // diagnostic report is produced.
+  CreateTempFile("loop1.proto",
+                 "syntax = \"proto3\";\n"
+                 "package pkg.loop1;\n"
+                 "import \"loop2.proto\";\n"
+                 "message L1 {}\n");
+  CreateTempFile("loop2.proto",
+                 "syntax = \"proto3\";\n"
+                 "package pkg.loop2;\n"
+                 "import \"loop1.proto\";\n"
+                 "message L2 {}\n");
+
+  Run("protocol_compiler --import_diagnostic_out=$tmpdir/report "
+      "--proto_path=$tmpdir loop1.proto");
+
+  ExpectErrorSubstring("recursively imports itself");
+}
+
+TEST_F(CommandLineInterfaceTest, ImportDiagnosticExtendeeAndEnum) {
+  // Extending a message and using an enum from the same file both count as
+  // references.
+  CreateTempFile("target.proto",
+                 "syntax = \"proto2\";\n"
+                 "package pkg.ext;\n"
+                 "message T { extensions 100 to max; }\n"
+                 "enum E { E0 = 0; }\n");
+  CreateTempFile("extender.proto",
+                 "syntax = \"proto2\";\n"
+                 "package pkg.extender;\n"
+                 "import \"target.proto\";\n"
+                 "extend pkg.ext.T { optional pkg.ext.E ext_field = 100; }\n");
+
+  Run("protocol_compiler --import_diagnostic_out=$tmpdir/report "
+      "--proto_path=$tmpdir extender.proto");
+
+  ExpectNoErrors();
+  ExpectFileContentContainsSubstring(
+      "report", "import \"target.proto\": used-direct\n");
+  ExpectFileContentContainsSubstring(
+      "report", "symbol \"pkg.ext.T\" (extendee) defined in \"target.proto\"\n");
+  ExpectFileContentContainsSubstring(
+      "report", "symbol \"pkg.ext.E\" (enum) defined in \"target.proto\"\n");
+}
+
+TEST_F(CommandLineInterfaceTest, ImportDiagnosticFromDescriptorSet) {
+  // The analysis is descriptor-based and works without SourceCodeInfo, e.g.
+  // when the input comes from a descriptor set that was written without
+  // --include_source_info.
+  CreateTempFile("c.proto",
+                 "syntax = \"proto3\";\n"
+                 "package pkg.c;\n"
+                 "message Msg {}\n");
+  CreateTempFile("b.proto",
+                 "syntax = \"proto3\";\n"
+                 "package pkg.b;\n"
+                 "import public \"c.proto\";\n");
+  CreateTempFile("a.proto",
+                 "syntax = \"proto3\";\n"
+                 "package pkg.a;\n"
+                 "import \"b.proto\";\n"
+                 "message A { pkg.c.Msg f = 1; }\n");
+
+  Run("protocol_compiler --descriptor_set_out=$tmpdir/chain.pb "
+      "--include_imports --proto_path=$tmpdir a.proto");
+  ExpectNoErrors();
+
+  Run("protocol_compiler --import_diagnostic_out=$tmpdir/report "
+      "--descriptor_set_in=$tmpdir/chain.pb a.proto");
+  ExpectNoErrors();
+  ExpectFileContentContainsSubstring(
+      "report",
+      "symbol \"pkg.c.Msg\" (message) defined in \"c.proto\"\n"
+      "    chain: a.proto -[import]-> b.proto -[public]-> c.proto\n");
+}
+
+TEST_F(CommandLineInterfaceTest, ImportDiagnosticFlagMisuse) {
+  CreateTempFile("foo.proto",
+                 "syntax = \"proto2\";\n"
+                 "message Foo {}\n");
+
+  Run("protocol_compiler --import_diagnostic_out=$tmpdir/r1 "
+      "--import_diagnostic_out=$tmpdir/r2 "
+      "--proto_path=$tmpdir foo.proto");
+  ExpectErrorText("--import_diagnostic_out may only be passed once.\n");
+
+  Run("protocol_compiler --import_diagnostic_out=$tmpdir/report "
+      "--print_free_field_numbers --proto_path=$tmpdir foo.proto");
+  ExpectErrorText(
+      "Can only use --import_diagnostic_out=FILE when compiling.\n");
+}
+
 TEST_F(CommandLineInterfaceTest, TestArgumentFile) {
   // Test parsing multiple input files using an argument file.
 
